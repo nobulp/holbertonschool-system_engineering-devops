@@ -1,0 +1,87 @@
+# 0. Simple Web Stack
+
+## Infrastructure Diagram
+
+```
+User (browser)
+     |
+     | types www.foobar.com
+     v
+[DNS Resolution]
+  foobar.com  -->  A record / CNAME www  -->  8.8.8.8
+     |
+     | HTTP/HTTPS request to 8.8.8.8
+     v
++-----------------------------------------------+
+|              SERVER  (IP: 8.8.8.8)            |
+|                                               |
+|   +----------+      +--------------------+   |
+|   |  Nginx   |----->| Application Server |   |
+|   | (Web     |      | (e.g. PHP-FPM /    |   |
+|   |  Server) |      |  Python / Node)    |   |
+|   +----------+      +--------+-----------+   |
+|                              |               |
+|                     +--------v-----------+   |
+|                     |     MySQL          |   |
+|                     |   (Database)       |   |
+|                     +--------------------+   |
+|                                               |
+|          /var/www/foobar  (codebase)          |
++-----------------------------------------------+
+```
+
+---
+
+## User Journey
+
+1. A user opens a browser and types `www.foobar.com`.
+2. The browser asks a DNS resolver to translate that name into an IP address.
+3. DNS responds with `8.8.8.8` (the A record for `www.foobar.com`).
+4. The browser opens a TCP connection to `8.8.8.8` on port 80 (HTTP) or 443 (HTTPS).
+5. **Nginx** receives the request and forwards it to the **application server**.
+6. The application server executes the application code (PHP, Python, Ruby, etc.).
+7. If the code needs persistent data it queries **MySQL**.
+8. The response travels back through the same chain and is rendered in the user's browser.
+
+---
+
+## Specifics
+
+### What is a server?
+A server is a physical or virtual machine that provides services (web pages, APIs, data, etc.) to other computers (clients) over a network. It runs 24/7, listens on network ports, and processes incoming requests.
+
+### Role of the domain name
+A domain name (`foobar.com`) is a human-readable alias for a numeric IP address. It lets users type a memorable name instead of `8.8.8.8`. The Domain Name System (DNS) maps the name to the correct IP at resolution time.
+
+### DNS record type for `www`
+`www.foobar.com` uses an **A record** that maps the hostname directly to the IPv4 address `8.8.8.8`.
+(Alternatively a CNAME could alias `www` to the apex `foobar.com`, which itself has an A record, but a direct A record is the most common setup.)
+
+### Role of the web server (Nginx)
+Nginx handles raw HTTP/HTTPS traffic:
+- Terminates TLS (HTTPS).
+- Serves static assets (images, CSS, JS) directly from disk.
+- Reverse-proxies dynamic requests to the application server (e.g., via FastCGI or a Unix socket).
+- Manages keep-alive connections and request queuing.
+
+### Role of the application server
+The application server runs the business logic of the website. It interprets the application code (e.g., PHP-FPM, Gunicorn for Python, Puma for Ruby), builds the HTML/JSON response, and interacts with the database when needed. It is not exposed directly to the internet; Nginx sits in front of it.
+
+### Role of the database (MySQL)
+MySQL stores and manages persistent, structured data (user accounts, posts, orders, etc.). The application server sends SQL queries; MySQL processes them and returns result sets. It handles concurrent access, transactions, and data integrity.
+
+### Communication protocol between server and user
+The server communicates with the user's browser using **HTTP** (port 80) or **HTTPS** (port 443), both of which run over **TCP/IP**. HTTPS adds TLS encryption so the data is private and tamper-proof in transit.
+
+---
+
+## Issues with this infrastructure
+
+### Single Point of Failure (SPOF)
+Every component lives on one machine. If the server crashes, loses power, or has a hardware fault, the entire website goes down. There is no redundancy or failover.
+
+### Downtime during maintenance
+Deploying new code usually requires restarting the application server or Nginx. During that restart window, incoming requests cannot be served, causing brief (or extended) downtime. There is no second server to absorb traffic while the first one restarts.
+
+### Cannot scale under high traffic
+A single server has fixed CPU, RAM, and network bandwidth. If traffic spikes beyond its capacity, response times degrade and requests are dropped. Horizontal scaling (adding more servers behind a load balancer) is not possible with this design, and vertical scaling (bigger hardware) has hard limits and requires a reboot.
