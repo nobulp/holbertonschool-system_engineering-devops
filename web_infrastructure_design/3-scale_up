@@ -1,0 +1,90 @@
+# 3. Scale Up
+
+## Application Server vs Web Server
+
+| | Web Server | Application Server |
+|---|---|---|
+| Primary role | Handles HTTP/HTTPS protocol, serves static files | Executes business logic, generates dynamic content |
+| Typical software | Nginx, Apache | Gunicorn, PHP-FPM, Puma, uWSGI, Node.js |
+| What it serves | HTML, CSS, JS, images (pre-built files on disk) | Database-driven pages, API responses, session logic |
+| Communicates with | Client browsers (and proxies to app server) | Web server (upstream) and database (downstream) |
+| Stateless? | Yes — just reads files | Often stateful (sessions, caches, business state) |
+| CPU/memory profile | Low — mostly I/O bound | Higher — compute-bound for complex logic |
+
+In a minimal setup both roles run on one machine. Separating them lets each tier be scaled, secured, and tuned independently.
+
+---
+
+## Infrastructure Diagram
+
+```
+User (browser)
+     |
+     | HTTPS (port 443)
+     v
++----+----+     keepalived / VRRP     +----+----+
+| HAProxy |<------------------------->| HAProxy |
+|  LB  1  |   (active-active cluster) |  LB  2  |
+| (primary|                           |(secondary|
+|  VIP)   |                           |  VIP)   |
++----+----+                           +----+----+
+     |                                     |
+     +------------------+------------------+
+                        |
+              (internal network)
+                        |
+          +-------------+-------------+
+          |             |             |
+          v             v             v
+    +-----+----+  +-----+----+  +----+------+
+    |  Web     |  |  App     |  | Database  |
+    |  Server  |  |  Server  |  |  Server   |
+    |----------|  |----------|  |-----------|
+    |  Nginx   |  | App code |  |  MySQL    |
+    |  (static |  | (Gunicorn|  | PRIMARY   |
+    |   files, |  |  PHP-FPM |  |           |
+    |  proxy)  |  |  etc.)   |  |           |
+    +----------+  +----------+  +-----------+
+```
+
+---
+
+## User Journey
+
+1. User sends an HTTPS request to `www.foobar.com`.
+2. The **HAProxy cluster** (active-active, sharing a Virtual IP via keepalived/VRRP) receives it. Both load balancers are live; if one fails, the other holds the VIP and keeps serving traffic with zero downtime.
+3. HAProxy forwards the request to the **Web Server** (Nginx).
+4. Nginx serves static assets directly from disk. For dynamic requests it proxies upstream to the **Application Server**.
+5. The Application Server runs the business logic and queries the **Database Server** (MySQL) as needed.
+6. The response flows back through Nginx → HAProxy → user.
+
+---
+
+## Why Each Element Was Added
+
+### Additional Server (dedicated per component)
+Previously, the web server, application server, and database all shared the same machines. This caused resource contention, security coupling, and inflexible scaling. Splitting each component onto its own dedicated server means:
+- **Web Server**: optimised for high-concurrency I/O, serving static files and terminating connections quickly. Tuning (worker threads, file descriptor limits, caching headers) does not interfere with other processes.
+- **Application Server**: can be scaled or restarted independently during deployments without touching Nginx or the database. Memory and CPU can be sized for the compute demands of the business logic alone.
+- **Database Server**: gets dedicated IOPS, RAM for the buffer pool, and CPU for query execution. No noisy neighbour from web or app processes. Security rules can tightly restrict access to port 3306 from only the application server.
+
+### Second Load Balancer (HAProxy cluster)
+In the previous design HAProxy was a single point of failure — if it went down, the entire site became unreachable even though the backend servers were healthy. Adding a second HAProxy and configuring both in a **cluster** with **keepalived/VRRP** solves this:
+- Both nodes share a **Virtual IP (VIP)**. The primary node holds the VIP and handles traffic.
+- keepalived sends heartbeats between the two nodes. If the primary becomes unreachable, the secondary claims the VIP within seconds.
+- In an **active-active** variant both nodes handle traffic simultaneously and the VIP floats to whichever is healthy; in **active-passive** the secondary stays on standby and only takes over on failure.
+- The result is a highly available entry point with no single point of failure at the load-balancing tier.
+
+---
+
+## Issues Resolved vs. Remaining
+
+### Resolved
+- No more SPOF at the load balancer tier.
+- No more resource contention between web, app, and database layers.
+- Each component can be scaled, patched, and restarted independently.
+
+### Still Present / Next Steps
+- The database server remains a single node. A Primary-Replica pair with automatic failover (e.g., MySQL MHA or Orchestrator) should be added.
+- SSL termination still happens at the load balancer; end-to-end encryption to the web server tier is not yet configured.
+- Firewalls and monitoring agents should be applied to each of the new dedicated servers as described in task 2.

@@ -13,6 +13,7 @@ Each file contains a whiteboard-style diagram, a walk-through of every component
 | 0 | [0-simple_web_stack](./0-simple_web_stack) | Single server — LAMP stack (Nginx + App Server + MySQL) behind one IP |
 | 1 | [1-distributed_web_infrastructure](./1-distributed_web_infrastructure) | Three servers — HAProxy load balancer + 2 app servers + MySQL Primary-Replica cluster |
 | 2 | [2-secured_and_monitored_web_infrastructure](./2-secured_and_monitored_web_infrastructure) | Secured stack — 3 firewalls, SSL/TLS termination, 3 monitoring agents (Sumo Logic) |
+| 3 | [3-scale_up](./3-scale_up) | Scaled stack — HAProxy cluster (VRRP), dedicated web/app/db servers, app vs web server explained |
 
 ---
 
