@@ -1,0 +1,148 @@
+# 2. Secured and Monitored Web Infrastructure
+
+## Infrastructure Diagram
+
+```
+User (browser)
+     |
+     | HTTPS (port 443)
+     v
++----+-----------------------------+
+|  Firewall 1                      |
+|  (allow 443 in, block all else)  |
++----+-----------------------------+
+     |
+     v
++----+------------------------------+
+|   HAProxy Load Balancer           |
+|   SSL termination (TLS cert here) |
+|   Algorithm: Round Robin          |
+|   [ Monitoring Client 1 ]         |
++----+--------------+---------------+
+     |              |
+     v              v
++----+----+    +----+----+
+|Firewall2|    |Firewall3|
++----+----+    +----+----+
+     |              |
+     v              v
++----+----+    +----+----+
+| Server 1|    | Server 2|
+|---------|    |---------|
+|  Nginx  |    |  Nginx  |
+|  (web)  |    |  (web)  |
+|---------|    |---------|
+|  App    |    |  App    |
+| Server  |    | Server  |
+|---------|    |---------|
+| Codebase|    | Codebase|
+|---------|    |---------|
+| Monitor |    | Monitor |
+| Client 2|    | Client 3|
++---------+    +----+----+
+                    |
+         +----------+----------+
+         |                     |
+    +----+-------+     +-------+----+
+    |  MySQL     |     |  MySQL     |
+    |  PRIMARY   +---->+  REPLICA   |
+    | (R/W)      | rep | (R only)   |
+    +------------+     +------------+
+```
+
+---
+
+## User Journey
+
+1. User types `https://www.foobar.com` in their browser.
+2. DNS resolves `www.foobar.com` to the load balancer's IP via an A record.
+3. The request reaches **Firewall 1**, which allows only port 443 (HTTPS) and drops everything else.
+4. **HAProxy** terminates the TLS connection using the SSL certificate, then forwards the decrypted request over the internal network to one of the two backend servers.
+5. The backend server's **Firewall** allows only traffic from the load balancer's IP.
+6. **Nginx** receives the request, serves static assets or proxies to the **application server**.
+7. The app server queries **MySQL Primary** for writes or **MySQL Replica** for reads.
+8. The response is returned to HAProxy, re-encrypted if needed, and sent back to the user.
+9. Throughout all this, each **monitoring client** collects metrics and ships them to the monitoring platform (e.g., Sumo Logic).
+
+---
+
+## Why Each Element Was Added
+
+### 3 Firewalls
+Each network boundary needs protection. One firewall is not enough because a compromised component inside the perimeter could attack other components freely.
+- **Firewall 1** (in front of HAProxy): blocks all traffic except HTTPS (443) from the public internet.
+- **Firewall 2 & 3** (in front of each server): restrict inbound connections to only the load balancer's IP and necessary ports (e.g., 80 for internal HTTP, 3306 only from app servers to DB). This implements **defense in depth** — even if one layer is breached, the next layer still protects.
+
+### SSL Certificate
+Encrypts traffic between the user's browser and the load balancer. Prevents eavesdropping, man-in-the-middle attacks, and data tampering in transit. Also required for browser trust indicators (the padlock) and is a prerequisite for modern HTTP features (HTTP/2, HSTS).
+
+### 3 Monitoring Clients
+One monitoring agent per server (including the load balancer). Each agent collects local metrics (CPU, memory, disk, process health, application logs, request rates) and forwards them to a centralized monitoring service such as Sumo Logic, Datadog, or Prometheus. Visibility across all three machines is necessary to correlate events and detect failures anywhere in the stack.
+
+---
+
+## Specifics
+
+### What are firewalls for?
+A firewall is a network security control that inspects packets and enforces rules about which traffic is allowed or denied based on source IP, destination IP, port, and protocol. Firewalls:
+- Reduce the attack surface by closing ports that should not be reachable.
+- Contain breaches by limiting lateral movement between internal components.
+- Provide a log of connection attempts for auditing and intrusion detection.
+
+### Why serve traffic over HTTPS?
+- **Confidentiality**: data (passwords, cookies, personal information) is encrypted so it cannot be read in transit.
+- **Integrity**: TLS ensures data has not been tampered with between client and server.
+- **Authentication**: the SSL certificate proves to the browser that it is talking to the legitimate server, not an impostor.
+- **Compliance**: regulations such as GDPR, PCI-DSS, and HIPAA require encrypted transmission of sensitive data.
+- **SEO and browser policy**: modern browsers flag plain HTTP sites as "Not Secure" and search engines penalise them.
+
+### What is monitoring used for?
+Monitoring provides continuous visibility into the health, performance, and availability of every component:
+- **Alerting**: notify on-call engineers when something breaks (server down, high error rate, disk full).
+- **Diagnostics**: metrics and logs help identify the root cause of incidents quickly.
+- **Capacity planning**: trend data shows when resources need to be scaled before they become a bottleneck.
+- **SLA enforcement**: uptime and latency metrics provide evidence of whether service-level objectives are being met.
+
+### How does the monitoring tool collect data?
+Each server runs a **monitoring client (agent)**. The agent:
+1. Polls local sources at regular intervals: OS metrics via `/proc`, application metrics via exposed endpoints (e.g., Nginx `stub_status`, MySQL `SHOW STATUS`), and log files.
+2. Parses, enriches, and buffers the data locally.
+3. Ships the data over an encrypted channel (HTTPS or a proprietary protocol) to the centralized monitoring platform.
+4. The platform aggregates data from all agents, stores it, and makes it queryable for dashboards and alerts.
+
+### How to monitor web server QPS (Queries Per Second)
+1. **Enable Nginx `stub_status`** (or the equivalent metric endpoint):
+   ```nginx
+   location /nginx_status {
+       stub_status on;
+       allow 127.0.0.1;
+       deny all;
+   }
+   ```
+2. Configure the monitoring agent to scrape this endpoint at a fixed interval (e.g., every 10 seconds). The `requests` counter divided by the scrape interval gives the QPS.
+3. Alternatively, parse Nginx access logs in real time: the agent tails the log file, counts lines per second, and emits a QPS metric.
+4. Create a dashboard widget and an alert threshold (e.g., alert if QPS drops to zero for 1 minute — likely a server outage — or spikes above a safe maximum).
+
+---
+
+## Issues with This Infrastructure
+
+### Terminating SSL at the load balancer level is an issue
+When HAProxy terminates TLS, traffic between the load balancer and the backend servers travels **unencrypted** over the internal network. This means:
+- An attacker who compromises the internal network (or the load balancer itself) can read all traffic in plaintext.
+- The backend servers have no way to verify they are receiving traffic from a legitimate source.
+- Many compliance frameworks (PCI-DSS, HIPAA) require end-to-end encryption, which SSL termination at the LB violates.
+The fix is **SSL passthrough** (HAProxy forwards the encrypted stream to the backend) or **re-encryption** (HAProxy decrypts and re-encrypts for the backend leg).
+
+### Only one MySQL server capable of accepting writes is an issue
+The Primary node is the sole write endpoint. This creates:
+- **SPOF for writes**: if the Primary fails, all `INSERT`/`UPDATE`/`DELETE` operations are blocked until a Replica is manually or automatically promoted. This causes data loss risk and write downtime.
+- **Write bottleneck**: all write traffic is serialised through a single node. Under high write load, the Primary becomes the limiting factor and cannot be horizontally scaled without restructuring (sharding, multi-master, etc.).
+
+### Having all components on every server is a problem
+Running the web server, application server, and database on the same machines creates:
+- **Resource contention**: a spike in database CPU or memory starves the web/app processes on the same host, and vice versa.
+- **Security blast radius**: a vulnerability in one component (e.g., the web server) gives the attacker access to the database process on the same machine.
+- **Inflexibility**: you cannot scale the database tier independently from the web tier. If reads are the bottleneck, you must add a full server (with all components) instead of just a database Replica.
+- **Noisy-neighbour deployments**: deploying new application code can destabilise the database running on the same host.
+The standard fix is to separate concerns: dedicated web/app servers and dedicated database servers, each scalable and securable independently.
