@@ -11,6 +11,7 @@ Each file contains a whiteboard-style diagram, a walk-through of every component
 | # | File | Description |
 |---|------|-------------|
 | 0 | [0-simple_web_stack](./0-simple_web_stack) | Single server — LAMP stack (Nginx + App Server + MySQL) behind one IP |
+| 1 | [1-distributed_web_infrastructure](./1-distributed_web_infrastructure) | Three servers — HAProxy load balancer + 2 app servers + MySQL Primary-Replica cluster |
 
 ---
 

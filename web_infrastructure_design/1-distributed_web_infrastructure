@@ -1,0 +1,146 @@
+# 1. Distributed Web Infrastructure
+
+## Infrastructure Diagram
+
+```
+User (browser)
+     |
+     | types www.foobar.com
+     v
+[DNS Resolution]
+  www.foobar.com  -->  A record  -->  8.8.8.8
+     |
+     | HTTP/HTTPS request
+     v
++---------------------------+
+|   HAProxy Load Balancer   |
+|      (IP: 8.8.8.8)        |
+|  Algorithm: Round Robin   |
++----------+----------------+
+           |
+     ------+------
+     |            |
+     v            v
++----+----+  +----+----+
+| Server 1|  | Server 2|
+|---------|  |---------|
+|  Nginx  |  |  Nginx  |
+|  (web)  |  |  (web)  |
+|---------|  |---------|
+|  App    |  |  App    |
+| Server  |  | Server  |
+|---------|  |---------|
+| Codebase|  | Codebase|
++---------+  +----+----+
+                  |
+       (replication)
+     +------------+------------+
+     |                         |
++----+-------+         +-------+----+
+|  MySQL     |         |  MySQL     |
+|  PRIMARY   | ------> |  REPLICA   |
+| (READ/WRITE)|  sync  | (READ only)|
++------------+         +------------+
+```
+
+---
+
+## User Journey
+
+1. The user types `www.foobar.com` in a browser.
+2. DNS resolves `www.foobar.com` to `8.8.8.8` via an A record.
+3. The browser sends an HTTP request to `8.8.8.8`, which is the HAProxy load balancer.
+4. HAProxy picks one of the two backend servers using its Round Robin algorithm and forwards the request.
+5. The chosen server's Nginx web server receives the request, serves static files directly or proxies dynamic requests to the application server.
+6. The application server executes the code, reads from or writes to the MySQL database.
+7. The response travels back to the user's browser.
+
+---
+
+## Why Each Element Was Added
+
+### Load Balancer (HAProxy)
+A single server creates a SPOF and has limited capacity. HAProxy sits in front of both servers and distributes incoming requests between them. This provides:
+- **High availability** — if one server goes down, HAProxy routes all traffic to the other.
+- **Horizontal scalability** — traffic is spread across multiple machines, increasing throughput.
+
+### Second Server
+One server alone is a SPOF. Adding a second server means:
+- Redundancy: the site stays up if one server fails.
+- Extra compute capacity for handling more concurrent users.
+
+### MySQL Primary-Replica Cluster
+A single database node is a SPOF and a write bottleneck. Splitting into Primary and Replica provides:
+- **Redundancy**: the Replica holds a live copy of the data.
+- **Read scalability**: read-heavy queries can be directed to the Replica, offloading the Primary.
+
+---
+
+## Load Balancer Configuration
+
+### Distribution Algorithm — Round Robin
+Round Robin sends each new request to the next server in a circular list.
+
+```
+Request 1  →  Server 1
+Request 2  →  Server 2
+Request 3  →  Server 1
+Request 4  →  Server 2
+...
+```
+
+Each server receives an equal share of requests over time. It works well when servers have similar hardware and the application is stateless (or session stickiness is handled separately).
+
+### Active-Active vs. Active-Passive
+
+| | Active-Active | Active-Passive |
+|---|---|---|
+| Both servers running? | Yes — both handle live traffic | No — one runs, one is on standby |
+| Traffic distribution | Split across all nodes | All traffic goes to the active node |
+| Failover | Remaining nodes absorb load immediately | Standby is promoted only when the active node fails |
+| Resource efficiency | Higher — all hardware is used | Lower — standby sits idle |
+
+**This infrastructure uses Active-Active.** HAProxy sends traffic to both Server 1 and Server 2 simultaneously. Both are "active" and serving real users at all times.
+
+---
+
+## How a Primary-Replica (Master-Slave) Database Cluster Works
+
+1. The **Primary** node accepts all `INSERT`, `UPDATE`, and `DELETE` operations (writes). It is the single source of truth.
+2. Every write on the Primary is recorded in a **binary log**.
+3. The **Replica** node connects to the Primary, reads the binary log, and replays each event on its own copy of the data — this is called **replication**.
+4. The Replica stays nearly in sync with the Primary (typically milliseconds behind, called replication lag).
+5. The Replica handles `SELECT` queries (reads), reducing load on the Primary.
+
+### Primary node vs. Replica node — from the application's perspective
+
+| | Primary | Replica |
+|---|---|---|
+| Accepts writes? | **Yes** | No (read-only) |
+| Accepts reads? | Yes | **Yes** (preferred for reads) |
+| Role in the app | Handles all data mutations | Serves read queries to reduce Primary load |
+| Promoted on failure? | N/A | Can be promoted to Primary manually or automatically |
+
+The application must be configured to route write queries to the Primary and can optionally route read queries to the Replica.
+
+---
+
+## Issues with This Infrastructure
+
+### Single Points of Failure (SPOF)
+
+- **Load balancer itself**: HAProxy is the single entry point. If it crashes, the entire site becomes unreachable, even though both backend servers are healthy. A second HAProxy in a keepalived/VRRP pair is the standard fix.
+- **Primary database**: If the Primary MySQL node fails before the Replica is promoted, all writes are blocked. Automatic failover (e.g., via MHA or Orchestrator) is not configured here.
+
+### Security Issues
+
+- **No firewall**: All ports on all servers are exposed to the internet. An attacker can probe MySQL (3306), the app server ports, and internal services directly.
+- **No HTTPS / TLS**: Traffic between the user's browser and HAProxy travels in plaintext over HTTP. Credentials, cookies, and personal data are visible to anyone on the network path (man-in-the-middle attacks, eavesdropping).
+
+### No Monitoring
+
+There is no visibility into the health of any component:
+- CPU, memory, and disk usage are unobserved — the system can run out of resources silently.
+- There are no alerts when a server goes down, a deployment fails, or the database replication lags.
+- Incident response is reactive (users report breakage) rather than proactive.
+- Without metrics, capacity planning and performance tuning are impossible.
